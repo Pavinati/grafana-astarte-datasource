@@ -20,6 +20,8 @@
 
 import _ from 'lodash';
 
+const REQUEST_SAMPLE_LIMIT = 5000;
+
 export default class AstarteDatasource {
     id: number;
     name: string;
@@ -56,7 +58,7 @@ export default class AstarteDatasource {
         return encodeURI(query);
     }
 
-    buildEndpointQuery(deviceId, interfaceName, path, since, to, downsampleTo) {
+    buildEndpointQuery(deviceId, interfaceName, path, since, to, limit) {
         let query: string = this.baseQueryPath();
 
         if (this.isBase64Id(deviceId)) {
@@ -77,11 +79,59 @@ export default class AstarteDatasource {
         if (to) {
             query += `&to=${to.toISOString()}`;
         }
-        if (downsampleTo > 0) {
-            query += `&downsample_to=${Math.floor(downsampleTo)}`;
+        if (limit > 0) {
+            query += `&limit=${limit}`;
         }
 
         return encodeURI(query);
+    }
+
+    async getAllSamples(params) {
+        const {
+            deviceId,
+            interfaceName,
+            path,
+            since,
+            to,
+            label,
+        } = params;
+
+        const samples = {
+            label,
+            data: {},
+        };
+
+        let hasMore = true;
+        let startingTimestamp = since;
+
+        while (hasMore) {
+            const query = this.buildEndpointQuery(deviceId, interfaceName, path, startingTimestamp, to, REQUEST_SAMPLE_LIMIT);
+            const response = await this.backendSrv.datasourceRequest({
+                url: query,
+                method: 'GET',
+                headers: { 'Authorization': `Bearer ${this.token}` }
+            });
+
+            if (response.status == 200) {
+                let series = response.data.data;
+                for (let key in series) {
+                    const timeSeries = series[key];
+                    if (timeSeries.length && typeof timeSeries[0][0] === "number") {
+                        const prevData = samples.data[key] || [];
+                        samples.data[key] = prevData.concat(timeSeries);
+                    }
+                    if (timeSeries.length < REQUEST_SAMPLE_LIMIT) {
+                        hasMore = false;
+                    } else {
+                        startingTimestamp = new Date(timeSeries[timeSeries.length - 1][1]);
+                    }
+                }
+            } else {
+                hasMore = false;
+            }
+        }
+
+        return samples;
     }
 
     runAstarteQuery(query) {
@@ -101,7 +151,6 @@ export default class AstarteDatasource {
         let interval: number = options.intervalMs;
         let promises: any[] = [];
         let query: string;
-        let promise: any;
 
         for (let entry of options.targets) {
 
@@ -110,26 +159,14 @@ export default class AstarteDatasource {
             }
 
             if (entry.deviceid && entry.interface) {
-                query = this.buildEndpointQuery
-                        ( entry.deviceid
-                        , entry.interface
-                        , entry.path
-                        , from
-                        , to
-                        , (toTime - fromTime) / interval
-                        );
-
-                promise = this.runAstarteQuery(query);
-
-                promises.push(promise.then(response => {
-
-                    if (this.isBase64Id(entry.deviceid)) {
-                        response.deviceLabel = entry.deviceid.substring(0, 5);
-                    } else {
-                        response.deviceLabel = entry.deviceid;
-                    }
-
-                    return response;
+                const label = this.isBase64Id(entry.deviceid) ? entry.deviceid.substring(0, 5) : entry.deviceid;
+                promises.push(this.getAllSamples({
+                    deviceId: entry.deviceid,
+                    interfaceName: entry.interface,
+                    path: entry.path,
+                    since: from,
+                    to,
+                    label,
                 }));
             }
         }
@@ -140,31 +177,15 @@ export default class AstarteDatasource {
 
         let allPromises: any;
         allPromises = this.$q.all(promises).then(results => {
-
             let result: any = { data : [] };
-
             _.forEach(results, function(response) {
-
-                if (response.status == 200) {
-                    let series: any = response.data.data;
-                    let targetName: string;
-
-                    //use for - in (instead of for - on) loop
-                    //because data arrives in an associative array
-                    for (let key in series) {
-                        let timeSeries = series[key];
-
-                        targetName = `${key}[${response.deviceLabel}]`;
-
-                        if (timeSeries.length && typeof timeSeries[0][0] === "number") {
-                            //TODO: implement data column selection/filter
-                            result.data.push({ "target": targetName, "datapoints": timeSeries });
-                        }
-                    }
+                for (const key in response.data) {
+                    result.data.push({
+                        target: `${key}[${response.label}]`,
+                        datapoints: response.data[key],
+                    });
                 }
-
             });
-
             return result;
         });
 
